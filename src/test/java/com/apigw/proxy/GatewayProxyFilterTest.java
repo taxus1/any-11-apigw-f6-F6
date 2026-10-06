@@ -2,6 +2,8 @@ package com.apigw.proxy;
 
 import com.apigw.domain.route.GatewayRoute;
 import com.apigw.domain.route.GatewayRule;
+import com.apigw.domain.route.CircuitBreakerPolicy;
+import com.apigw.domain.route.RetryPolicy;
 import com.apigw.proxy.accesslog.AccessLogRecorder;
 import com.apigw.proxy.config.GatewayProxyProperties;
 import com.apigw.proxy.forward.UpstreamForwarder;
@@ -25,6 +27,7 @@ import reactor.netty.http.server.HttpServer;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -60,7 +63,8 @@ class GatewayProxyFilterTest {
         upstream = new FakeUpstream();
         store = new InMemoryRouteStore();
         var props = new GatewayProxyProperties(
-                Duration.ofMillis(500), Duration.ofMillis(800), Duration.ofHours(1));
+                Duration.ofMillis(500), Duration.ofMillis(800), Duration.ofHours(1),
+                200, 200, org.springframework.util.unit.DataSize.ofMegabytes(1));
         catalog = new RouteCatalog(store, props);
 
         var nettyClient = reactor.netty.http.client.HttpClient.create()
@@ -74,7 +78,10 @@ class GatewayProxyFilterTest {
                 .build();
 
         var filter = new GatewayProxyWebFilter(
-                catalog, new RouteMatcher(), new UpstreamForwarder(webClient),
+                catalog, new RouteMatcher(),
+                new com.apigw.proxy.resilience.ResilientUpstreamExecutor(
+                        new UpstreamForwarder(webClient),
+                        new com.apigw.proxy.resilience.CircuitBreakerRegistry(), props),
                 new AccessLogRecorder(), e -> recordedEntries.add(e), new ObjectMapper(),
                 // 本测试不涉用户令牌：装一个「未启用」的守门人，验证老链路行为零变化
                 new com.apigw.proxy.userauth.UserAuthGatekeeper(null, null),
@@ -304,6 +311,104 @@ class GatewayProxyFilterTest {
         var resp = client.get().uri(baseUrl + "/order/1").exchange().block();
         assertThat(resp.statusCode().value()).isEqualTo(418);
         resp.releaseBody().block();
+    }
+
+    @Test
+    void retry_enabledOnRoute_retriesSafeGetOnceAndReturnsSecondSuccess() {
+        upstream.respondOnceThen(503, 200);
+        GatewayRoute r = route("order", upstream.baseUrl(),
+                List.of(cond("PATH_PREFIX", null, "/order/", 1)), List.of());
+        r.configureRetry(RetryPolicy.of(true, 2, Duration.ofMillis(10), Duration.ofSeconds(2),
+                Set.of("GET"), false, Set.of(503)));
+        loadRoutes(r);
+
+        var resp = client.get().uri(baseUrl + "/order/1").exchange().block();
+        assertThat(resp.statusCode()).isEqualTo(HttpStatus.OK);
+        resp.releaseBody().block();
+        assertThat(upstream.requestCount()).isEqualTo(2);
+    }
+
+    @Test
+    void retry_nonIdempotentPostIsNotRetriedEvenWhenRoutePathLooksLikeQuery() {
+        upstream.setResponseStatus(503);
+        GatewayRoute r = route("order", upstream.baseUrl(),
+                List.of(cond("PATH_PREFIX", null, "/order/", 1)), List.of());
+        // 即使把 POST 列入方法集，没有 idempotent=true 的内部约定也会在保存阶段被拒绝；
+        // 这里用只含安全方法的策略验证运行时绝不会靠 URL 判断。
+        r.configureRetry(RetryPolicy.of(true, 3, Duration.ofMillis(1), Duration.ofSeconds(2),
+                Set.of("GET"), false, Set.of(503)));
+        loadRoutes(r);
+
+        var resp = client.post().uri(baseUrl + "/order/query")
+                .header("Content-Type", "text/plain")
+                .bodyValue("{}")
+                .exchange().block();
+        assertThat(resp.statusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+        resp.releaseBody().block();
+        assertThat(upstream.requestCount()).isEqualTo(1);
+        assertThat(upstream.methods()).containsExactly("POST");
+    }
+
+    @Test
+    void retry_explicitIdempotentPost_canReplaySmallBodyAndHeadersExactlyOnce() {
+        upstream.respondOnceThen(503, 200);
+        GatewayRoute r = route("order", upstream.baseUrl(),
+                List.of(cond("PATH_PREFIX", null, "/order/", 1)),
+                List.of(act("REQ_ADD_HEADER", "X-Gw", "from-gw", 1)));
+        r.configureRetry(RetryPolicy.of(true, 2, Duration.ofMillis(5), Duration.ofSeconds(2),
+                Set.of("GET", "POST"), true, Set.of(503)));
+        loadRoutes(r);
+
+        var resp = client.post().uri(baseUrl + "/order/create")
+                .header("Content-Type", "text/plain")
+                .bodyValue("order-body")
+                .exchange().block();
+        assertThat(resp.statusCode()).isEqualTo(HttpStatus.OK);
+        resp.releaseBody().block();
+        assertThat(upstream.requestCount()).isEqualTo(2);
+        // 第二次请求重放的是同一个小 body；请求头动作和 XFF 追加不能重复执行
+        HttpExchange got = upstream.lastExchange();
+        assertThat(got.getRequestHeaders().get("X-Gw")).containsExactly("from-gw");
+        assertThat(got.getRequestHeaders().getFirst("X-Forwarded-For"))
+                .doesNotContain(", 127.0.0.1, 127.0.0.1");
+    }
+
+    @Test
+    void retry_fourXxIsPassedThroughWithoutRetry() {
+        upstream.setResponseStatus(400);
+        GatewayRoute r = route("order", upstream.baseUrl(),
+                List.of(cond("PATH_PREFIX", null, "/order/", 1)), List.of());
+        r.configureRetry(RetryPolicy.of(true, 3, Duration.ofMillis(1), Duration.ofSeconds(2),
+                Set.of("GET"), false, Set.of(503)));
+        loadRoutes(r);
+
+        var resp = client.get().uri(baseUrl + "/order/1").exchange().block();
+        assertThat(resp.statusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        resp.releaseBody().block();
+        assertThat(upstream.requestCount()).isEqualTo(1);
+    }
+
+    @Test
+    void circuitBreaker_opensAfterConfiguredFailures_andDoesNotInvokeRetryOnRejectedRequests() {
+        GatewayRoute r = route("dead", "http://127.0.0.1:1",
+                List.of(cond("PATH_PREFIX", null, "/dead/", 1)), List.of());
+        r.configureCircuitBreaker(CircuitBreakerPolicy.of(true, 5, 3, 100,
+                Duration.ofSeconds(60), 100, Set.of(502, 503, 504)));
+        r.configureRetry(RetryPolicy.of(true, 3, Duration.ofMillis(1), Duration.ofSeconds(2),
+                Set.of("GET"), false, Set.of(502, 503, 504)));
+        loadRoutes(r);
+
+        for (int i = 0; i < 3; i++) {
+            var probe = client.get().uri(baseUrl + "/dead/x").exchange().block();
+            assertThat(probe.statusCode()).isEqualTo(HttpStatus.BAD_GATEWAY);
+            probe.releaseBody().block();
+        }
+        var open = client.get().uri(baseUrl + "/dead/x").exchange().block();
+        assertThat(open.statusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+        assertThat(open.headers().asHttpHeaders().getFirst("X-Gateway-Error"))
+                .isEqualTo("UPSTREAM_CIRCUIT_OPEN");
+        assertThat(open.headers().asHttpHeaders().getFirst("Retry-After")).isNotBlank();
+        open.releaseBody().block();
     }
 
     @Test

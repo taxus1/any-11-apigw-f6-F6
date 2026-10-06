@@ -28,7 +28,9 @@ public class UpstreamClientConfig {
     @Bean
     public HttpClient upstreamHttpClient(GatewayProxyProperties properties) {
         ConnectionProvider provider = ConnectionProvider.builder("apigw-upstream")
-                .maxConnections(200)
+                .maxConnections(properties.maxConnections())
+                // 池满后不能无限排队：故障上游超时越久，排队请求会越多，必须有硬上限让网关快速失败
+                .pendingAcquireMaxCount(properties.maxPendingConnections())
                 .pendingAcquireTimeout(properties.connectTimeout())
                 .build();
 

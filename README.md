@@ -57,7 +57,9 @@ bash tools/start-echo-upstream.sh   # 本地回显上游，8091（另开一个�
     { "type": "RESP_ADD_HEADER", "name": "X-Trace", "value": "t-1", "sortNo": 3 },
     { "type": "RESP_REMOVE_HEADER", "name": "X-Debug", "sortNo": 4 }
   ],
-  "grayGroups": []
+  "grayGroups": [],
+  "circuitBreaker": { "enabled": false },
+  "retry": { "enabled": false }
 }
 ```
 
@@ -65,6 +67,7 @@ bash tools/start-echo-upstream.sh   # 本地回显上游，8091（另开一个�
 - `authRequired` 登录开关跟着路由走：`1` = 需登录（调用方必须带网关验得过的用户令牌，见「用户登录鉴权与身份透传」），`0`/不传 = 开放（谁都能打）。只认 0/1，别的值报「登录开关只能是 0（开放）或 1（需登录）」。
 - 匹配条件只认 `PATH_PREFIX` / `METHOD` / `HEADER` / `QUERY`；路径、方法两类不用填 `name`。
 - 转发动作只认 `REQ_ADD_HEADER` / `REQ_REMOVE_HEADER` / `RESP_ADD_HEADER` / `RESP_REMOVE_HEADER`；删头不用填 `value`。
+- `circuitBreaker`、`retry` 均可空：空或 `enabled=false` 表示关闭；开启后阈值/时长/比例必须在接口允许范围内，4xx 不允许配成熔断或重试失败。
 - 顺序号每组各自从 1 开始，必须**连续、不重**。撞号会报「匹配条件第 a 条与第 b 条的顺序号撞了，都是 n」；跳号会报缺了第几。
 - 上游地址必须是合法的 `http://` / `https://` URL（协议、主机、端口都像样），空串和乱码不收。
 - 修改时把条件/动作整批重排提交即可，服务端按新一批顺序号整树替换。
@@ -136,11 +139,59 @@ bash tools/start-echo-upstream.sh   # 本地回显上游，8091（另开一个�
 | 一条路由都没匹配上 | 404 | `NO_ROUTE` | 网关没找到路，前端据此与「后端业务报错」区分 |
 | 上游连不上（拒接/不可达/TLS 失败） | 502 | `UPSTREAM_UNAVAILABLE` | 上游没在或地址错 |
 | 上游半天不吭声（连接/读取超时） | 504 | `UPSTREAM_TIMEOUT` | 上游在但太慢/卡死，调用方不用干等 |
+| 熔断打开或半开未抽中探测名额 | 503 | `UPSTREAM_CIRCUIT_OPEN` | 网关本机判定该上游暂时不可用，并带 `Retry-After` |
 | 路由配置此刻读不出来（Redis 故障且无旧快照） | 503 | `CONFIG_UNAVAILABLE` | 网关侧配置故障 |
 
 - 上游自己的 4xx/5xx 是业务结果，状态码与响应体**原样透传**，网关不改写。
 - 错误体只有网关的固定文案 + traceId，绝不外抛内部堆栈或上游原始错误页。
 - 超时参数可调：`apigw.proxy.connect-timeout`（默认 3s）、`apigw.proxy.response-timeout`（默认 10s）。
+
+### 熔断与重试（均按路由开关）
+
+熔断和重试是路由 JSON 里的两个独立对象；不传、传 `enabled:false` 都是关闭，旧路由行为完全不变。两者各管各的，没开启的路由不会进入对应逻辑。熔断状态保存在每台网关进程内，不放 Redis，三台实例独立打开/恢复。
+
+```json
+"circuitBreaker": {
+  "enabled": true,
+  "windowSize": 20,
+  "minimumCalls": 5,
+  "failureRate": 50,
+  "openDuration": "30s",
+  "halfOpenPermitPercent": 10,
+  "failureStatuses": [500, 502, 503, 504]
+},
+"retry": {
+  "enabled": true,
+  "maxAttempts": 2,
+  "backoff": "100ms",
+  "totalTimeout": "15s",
+  "retryMethods": ["GET", "HEAD", "OPTIONS"],
+  "idempotent": false,
+  "retryStatuses": [500, 502, 503, 504]
+}
+```
+
+**熔断口径：**
+
+- CLOSED 正常放量，只保留最近 `windowSize` 次结果；样本数达到 `minimumCalls` 后，失败率 `>= failureRate%` 才 OPEN，避免低流量下一次偶发故障误断。
+- OPEN 持续 `openDuration`，期间请求不连上游，直接返回 503 `UPSTREAM_CIRCUIT_OPEN`，响应头给 `Retry-After`。
+- 等待结束进入 HALF_OPEN，按 `halfOpenPermitPercent` 均匀放探测请求（10% 就是每 10 笔候选请求放 1 笔，且第一笔可探）；探满 `minimumCalls` 笔后，失败率低于阈值才 CLOSED，否则重新 OPEN。
+- 算失败的只有：连接失败/不可达/TLS 失败、连接/读取超时，以及 `failureStatuses` 明确列出的 **5xx**。默认 500/502/503/504。
+- **所有 4xx（含 400/401/403/404/408/409/429）都不算上游故障**。4xx 表示这笔请求本身不满足上游业务/协议要求，重试或熔断通常没有意义，也不能把调用方错误归咎为上游宕机；状态仍原样透传。
+- 灰度按「路由 + grayGroup + 实际上游」分别熔断，避免一个灰度组拖挂时把另一个健康组也断开。
+
+**重试口径：**
+
+- `maxAttempts` 包含首次，默认且上限 5 次；每次按 `backoff` 固定等待，所有尝试和等待受 `totalTimeout` 总预算约束，到点不再发起新尝试，最终按实际失败返回。
+- 默认只重试 HTTP 安全方法 `GET/HEAD/OPTIONS`。`PUT/DELETE` 只有在该路由显式加入 `retryMethods` 时才重试；`POST/PATCH` 即使加入方法列表，也必须再设置 `idempotent:true`，表示该内部接口已用幂等键/唯一单号保证重复安全。
+- **绝不按 URL 猜测**：`POST /order/query` 仍是 POST，默认一次都不重试；`/payment/refund` 也不会因为名字像 query 就重试。
+- 默认只对连接失败、连接/读取超时和 `retryStatuses` 中的 5xx 重试；4xx 直接透传。所有尝试都失败时，把最后一次真实结果交回调用方，不伪造成功。
+- 请求头清洗、身份/通行头、`X-Forwarded-*`、请求类动作在一次逻辑请求中只做一次，再重放同一份已准备请求；重试不会重复追加头或执行两次动作。
+- 只有 `Content-Length` 明确且不超过 `apigw.proxy.max-retry-body-size`（默认 1MB）的请求体会缓存重放；大 body 或 chunked body 继续流式转发并自动放弃重试，防止网关堆内存被放大。
+
+**两者配合：**熔断检查在最前面。OPEN 拒绝的请求不读取/缓存请求体、不连接上游、**也不触发重试**，否则重试会把故障流量再次放大。重试是同一逻辑请求内的多次尝试，只占用一次 HALF_OPEN 探测名额，最终只向熔断器记一次结果；全部尝试失败才计一笔熔断失败。
+
+**资源兜底：**全局 WebClient 始终设置连接超时、单次响应/读取超时和有界连接池（默认 `max-connections=200`、`max-pending-connections=200`）。池满后排队也有上限，快速失败而不是无限堆积；重试同时受次数、退避、总时限和请求体缓存上限约束，避免一个大量超时的上游把网关线程/连接/内存拖光。
 
 ### 热刷新（不重启生效）
 

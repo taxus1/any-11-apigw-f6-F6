@@ -1,5 +1,6 @@
 package com.apigw.proxy.error;
 
+import com.apigw.proxy.resilience.CircuitOpenException;
 import io.netty.handler.timeout.ReadTimeoutException;
 import org.springframework.http.HttpStatus;
 
@@ -61,6 +62,8 @@ public enum UpstreamFailureKind {
             "上游服务暂时不可达（连接失败），网关未能完成转发"),
     UPSTREAM_TIMEOUT(HttpStatus.GATEWAY_TIMEOUT, "UPSTREAM_TIMEOUT",
             "上游服务响应超时，网关未在规定时间内拿到响应"),
+    UPSTREAM_CIRCUIT_OPEN(HttpStatus.SERVICE_UNAVAILABLE, "UPSTREAM_CIRCUIT_OPEN",
+            "上游服务连续失败，熔断暂时打开，请稍后再试"),
     CONFIG_UNAVAILABLE(HttpStatus.SERVICE_UNAVAILABLE, "CONFIG_UNAVAILABLE",
             "网关路由配置暂时不可用，请稍后重试"),
     UPSTREAM_PROTOCOL_ERROR(HttpStatus.BAD_GATEWAY, "UPSTREAM_PROTOCOL_ERROR",
@@ -101,6 +104,9 @@ public enum UpstreamFailureKind {
     public static UpstreamFailureKind classify(Throwable error) {
         java.util.Set<Throwable> seen = new java.util.HashSet<>();
         for (Throwable t = error; t != null && seen.add(t); t = t.getCause()) {
+            if (t instanceof CircuitOpenException) {
+                return UPSTREAM_CIRCUIT_OPEN;
+            }
             // 超时类放最前：ReadTimeoutException 本身也是 IOException 的子类，必须先判
             if (t instanceof ReadTimeoutException
                     || t instanceof TimeoutException

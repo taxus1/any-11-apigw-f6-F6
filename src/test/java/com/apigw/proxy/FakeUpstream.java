@@ -8,6 +8,7 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -25,6 +26,10 @@ class FakeUpstream implements AutoCloseable {
     private volatile int responseStatus = 200;
     private volatile String customBody;
     private volatile boolean hangForever;
+    private final AtomicInteger requestCount = new AtomicInteger();
+    private final CopyOnWriteArrayList<String> methods = new CopyOnWriteArrayList<>();
+    private final java.util.concurrent.BlockingQueue<Integer> statusSequence =
+            new java.util.concurrent.LinkedBlockingQueue<>();
 
     FakeUpstream() throws IOException {
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
@@ -50,8 +55,23 @@ class FakeUpstream implements AutoCloseable {
         return lastExchange.get();
     }
 
+    int requestCount() {
+        return requestCount.get();
+    }
+
+    CopyOnWriteArrayList<String> methods() {
+        return methods;
+    }
+
     void setResponseStatus(int status) {
+        statusSequence.clear();
         this.responseStatus = status;
+    }
+
+    void respondOnceThen(int firstStatus, int nextStatus) {
+        statusSequence.clear();
+        statusSequence.add(nextStatus);
+        this.responseStatus = firstStatus;
     }
 
     void setCustomBody(String body) {
@@ -64,6 +84,8 @@ class FakeUpstream implements AutoCloseable {
 
     private void handle(HttpExchange exchange) {
         lastExchange.set(exchange);
+        requestCount.incrementAndGet();
+        methods.add(exchange.getRequestMethod());
         if (hangForever) {
             // 读到请求后永不响应，逼网关走响应超时分支；可中断，close 时会被打断
             Thread t = Thread.currentThread();
@@ -91,8 +113,13 @@ class FakeUpstream implements AutoCloseable {
                                     ? "" : exchange.getRequestURI().getRawQuery())
                             + "\",\"headers\":{" + headers + "}}";
             byte[] out = body.getBytes(StandardCharsets.UTF_8);
+            Integer next = statusSequence.poll();
+            int status = responseStatus;
+            if (next != null) {
+                responseStatus = next;
+            }
             exchange.getResponseHeaders().add("Content-Type", "application/json");
-            exchange.sendResponseHeaders(responseStatus, out.length);
+            exchange.sendResponseHeaders(status, out.length);
             try (OutputStream os = exchange.getResponseBody()) {
                 os.write(out);
             }

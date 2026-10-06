@@ -67,6 +67,12 @@ public class GatewayRoute {
      */
     private List<GrayGroup> grayGroups = new ArrayList<>();
 
+    /** 路由级熔断配置；缺省关闭，旧配置行为不变。 */
+    private CircuitBreakerPolicy circuitBreaker = CircuitBreakerPolicy.disabled();
+
+    /** 路由级重试配置；缺省关闭，旧配置行为不变。 */
+    private RetryPolicy retry = RetryPolicy.disabled();
+
     public static GatewayRoute create(String routeNo, String name, String upstream,
                                       Integer enabled, String remark) {
         GatewayRoute route = new GatewayRoute();
@@ -81,6 +87,8 @@ public class GatewayRoute {
         route.setConditions(new ArrayList<>());
         route.setActions(new ArrayList<>());
         route.setGrayGroups(new ArrayList<>());
+        route.setCircuitBreaker(CircuitBreakerPolicy.disabled());
+        route.setRetry(RetryPolicy.disabled());
         return route;
     }
 
@@ -238,5 +246,15 @@ public class GatewayRoute {
     /** 是否配了灰度分组；没配时所有请求都打主上游，灰度逻辑完全不介入。 */
     public boolean hasGrayGroups() {
         return grayGroups != null && !grayGroups.isEmpty();
+    }
+
+    /** 替换熔断配置：null 表示该路由关闭熔断，其他字段缺省走策略自身默认值并完整校验。 */
+    public void configureCircuitBreaker(CircuitBreakerPolicy policy) {
+        this.circuitBreaker = policy == null ? CircuitBreakerPolicy.disabled() : policy;
+    }
+
+    /** 替换重试配置：null 表示该路由关闭重试，其他字段缺省走策略自身默认值并完整校验。 */
+    public void configureRetry(RetryPolicy policy) {
+        this.retry = policy == null ? RetryPolicy.disabled() : policy;
     }
 }

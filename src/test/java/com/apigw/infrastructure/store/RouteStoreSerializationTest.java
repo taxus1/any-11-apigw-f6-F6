@@ -1,11 +1,14 @@
 package com.apigw.infrastructure.store;
 
+import com.apigw.domain.route.CircuitBreakerPolicy;
 import com.apigw.domain.route.GatewayRoute;
 import com.apigw.domain.route.GrayGroup;
+import com.apigw.domain.route.RetryPolicy;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -68,5 +71,39 @@ class RouteStoreSerializationTest {
         GatewayRoute back = store.deserialize(legacy);
         assertThat(back.hasGrayGroups()).isFalse();
         assertThat(back.getGrayGroups()).isEmpty();
+    }
+
+    @Test
+    void circuitBreakerAndRetry_roundTripThroughJson() {
+        GatewayRoute r = GatewayRoute.create("resilient", "韧性路由", "http://svc:8080", 1, null);
+        r.configureCircuitBreaker(CircuitBreakerPolicy.of(true, 30, 8, 60,
+                java.time.Duration.ofSeconds(45), 20, Set.of(500, 503)));
+        r.configureRetry(RetryPolicy.of(true, 3, java.time.Duration.ofMillis(50),
+                java.time.Duration.ofSeconds(5), Set.of("GET", "PUT"), false, Set.of(502, 503)));
+
+        GatewayRoute back = store.deserialize(store.serialize(r));
+        assertThat(back.getCircuitBreaker().isEnabled()).isTrue();
+        assertThat(back.getCircuitBreaker().windowSize()).isEqualTo(30);
+        assertThat(back.getCircuitBreaker().minimumCalls()).isEqualTo(8);
+        assertThat(back.getCircuitBreaker().failureRate()).isEqualTo(60);
+        assertThat(back.getCircuitBreaker().openDuration()).isEqualTo(java.time.Duration.ofSeconds(45));
+        assertThat(back.getCircuitBreaker().halfOpenPermitPercent()).isEqualTo(20);
+        assertThat(back.getCircuitBreaker().failureStatuses()).containsExactlyInAnyOrder(500, 503);
+
+        assertThat(back.getRetry().isEnabled()).isTrue();
+        assertThat(back.getRetry().maxAttempts()).isEqualTo(3);
+        assertThat(back.getRetry().backoff()).isEqualTo(java.time.Duration.ofMillis(50));
+        assertThat(back.getRetry().totalTimeout()).isEqualTo(java.time.Duration.ofSeconds(5));
+        assertThat(back.getRetry().retryMethods()).containsExactlyInAnyOrder("GET", "PUT");
+    }
+
+    @Test
+    void legacyJsonWithoutResiliencePolicies_defaultsBothDisabled() {
+        String legacy = "{\"id\":\"id-1\",\"routeNo\":\"legacy\",\"name\":\"旧路由\","
+                + "\"upstream\":\"http://svc:8080\",\"enabled\":1,\"authRequired\":0,\"version\":3,"
+                + "\"conditions\":[],\"actions\":[]}";
+        GatewayRoute back = store.deserialize(legacy);
+        assertThat(back.getCircuitBreaker().isEnabled()).isFalse();
+        assertThat(back.getRetry().isEnabled()).isFalse();
     }
 }

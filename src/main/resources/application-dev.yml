@@ -30,6 +30,11 @@ apigw:
   proxy:
     connect-timeout: 3s
     response-timeout: 10s
+    # 故障上游的兜底资源闸：连接池占满后只允许少量请求排队，避免大量超时+重试无限占用网关资源
+    max-connections: 200
+    max-pending-connections: 200
+    # 只有 Content-Length 明确且不超过 1MB 的请求体才允许为重试缓存；大文件/chunked 继续流式且不重试
+    max-retry-body-size: 1MB
     route-refresh-interval: 10s
     # 兜底轮询周期（毫秒），与上面的 Duration 保持一致；@Scheduled 只吃 long/字符串
     route-refresh-interval-ms: 1000

@@ -3,11 +3,14 @@ package com.apigw.proxy.forward;
 import com.apigw.common.web.GatewayHeaders;
 import com.apigw.domain.route.GatewayRoute;
 import com.apigw.proxy.action.HeaderActionApplier;
+import com.apigw.proxy.resilience.UpstreamStatusRetryException;
 import com.apigw.proxy.userauth.OutboundAuth;
 import io.netty.handler.codec.http.HttpHeaderValues;
+import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.server.reactive.ServerHttpRequest;
 import org.springframework.stereotype.Component;
+import org.springframework.web.reactive.function.BodyInserter;
 import org.springframework.web.reactive.function.BodyInserters;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Mono;
@@ -18,6 +21,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.function.Predicate;
 
 /**
  * 把「已经匹配好路由」的请求发往上游，拿到上游响应头后交给上层落回给调用方。
@@ -34,7 +38,8 @@ import java.util.function.Function;
  * 3. 补 X-Forwarded-For / X-Forwarded-Proto / X-Forwarded-Host，让上游看得到原始链路信息；
  * 4. 写入网关认定的身份头与通行标记（来自 {@link OutboundAuth}，没验出身份就一个都不写）；
  * 5. 按顺序号执行本路由的请求类动作（补头覆盖同名旧值、删头彻底删除）；
- * 6. 请求体以数据流形式透传，不在网关里全量缓冲（大文件也只过一遍内存）。
+ * 6. 请求体默认以数据流形式透传，不在网关里全量缓冲；只有上层明确要求「可安全重放」且
+ *    Content-Length 明确、未超过上限时才缓存成字节数组供重试复用。
  */
 @Component
 public class UpstreamForwarder {
@@ -48,65 +53,28 @@ public class UpstreamForwarder {
 
     private final WebClient webClient;
 
-    public UpstreamForwarder(WebClient upstreamWebClient) {
-        this.webClient = upstreamWebClient;
+    public UpstreamForwarder(WebClient webClient) {
+        this.webClient = webClient;
     }
 
     /**
-     * 发往上游，并在「仍持有上游连接」的 exchangeToMono 回调里把响应交给 handler 处理。
-     *
-     * 关键点：WebClient（Reactor Netty）要求响应体必须在 exchangeToMono 回调内部消费，
-     * 一旦回调返回、连接释放，再拿 bodyToFlux 出来就是空流/已释放缓冲。所以这里把
-     * 「拿到状态码+响应头 → 把响应体写回调用方」整个动作作为 handler 传进来，在回调内完成。
-     *
-     * @param responseHandler 拿到上游响应（状态码、响应头、仍在连接上的响应体流）后执行；
-     *                        通常负责头清洗、响应动作、写回调用方
+     * 旧转发入口：只尝试一次，且不识别「可重试 5xx」。保留给不经过韧性执行器的测试/调用方。
      */
     public Mono<Void> forward(GatewayRoute route, ServerHttpRequest incoming,
                               String traceId, URI targetUri, OutboundAuth auth,
                               Function<UpstreamResponse, Mono<Void>> responseHandler) {
-        ServerHttpRequest mutated = prepareRequest(route, incoming, traceId, auth);
-
-        WebClient.RequestBodySpec spec = webClient
-                .method(HttpMethod.valueOf(incoming.getMethod().name()))
-                .uri(targetUri)
-                .headers(h -> h.addAll(mutated.getHeaders()));
-
-        // 请求体流式透传：DataBuffer 原样交给客户端，不缓冲、不改写
-        return spec.body(BodyInserters.fromDataBuffers(incoming.getBody()))
-                .exchangeToMono(response -> {
-                    UpstreamResponse upstreamResponse = new UpstreamResponse(
-                            response.statusCode().value(),
-                            response.headers().asHttpHeaders(),
-                            response.bodyToFlux(org.springframework.core.io.buffer.DataBuffer.class));
-                    return responseHandler.apply(upstreamResponse);
-                });
+        PreparedUpstreamRequest prepared = prepareRequest(route, incoming, traceId, auth, null);
+        return forwardAttempt(prepared, targetUri, responseHandler, status -> false);
     }
 
     /**
-     * 拼上游目标地址：上游 base（scheme://host:port）+ 原始请求路径（含原始 query）。
-     * 用原始（raw）形式拼接，避免对已经编码过的路径做二次编码。
+     * 只做一次请求头清洗/改写，并决定请求体如何发送。重试时反复调用 {@link #forwardAttempt}，
+     * 不再重复执行 mutate/action，避免 X-Forwarded-For 追加两次或某个补/删头动作被做两遍。
      */
-    public static URI resolveTargetUri(String upstreamBase, ServerHttpRequest request) {
-        URI base = URI.create(upstreamBase);
-        StringBuilder sb = new StringBuilder();
-        sb.append(base.getScheme()).append("://").append(base.getRawAuthority());
-        // base 里带的路径前缀（如 http://host/svc）拼在请求路径前；一般配置里不带
-        String basePath = base.getRawPath();
-        if (basePath != null && !basePath.isBlank() && !"/".equals(basePath)) {
-            sb.append(basePath);
-        }
-        sb.append(request.getPath().pathWithinApplication().value());
-        if (request.getURI().getRawQuery() != null) {
-            sb.append('?').append(request.getURI().getRawQuery());
-        }
-        return URI.create(sb.toString());
-    }
-
-    /** 构造发往上游的请求：头清洗 → 独占头清零 → X-Forwarded-* → 身份/通行头 → 请求动作。 */
-    private ServerHttpRequest prepareRequest(GatewayRoute route, ServerHttpRequest incoming,
-                                             String traceId, OutboundAuth auth) {
-        return incoming.mutate().headers(headers -> {
+    public PreparedUpstreamRequest prepareRequest(GatewayRoute route, ServerHttpRequest incoming,
+                                                  String traceId, OutboundAuth auth,
+                                                  byte[] bufferedBody) {
+        ServerHttpRequest mutated = incoming.mutate().headers(headers -> {
             // 1. 剔除逐跳头与报文绑定头（头名大小写不敏感，统一小写比对）
             HOP_BY_HOP.forEach(headers::remove);
             // TE 是逐跳头但 RFC 7231 允许 "trailers"：调用方带了就只放行这一个值，其余一律去掉
@@ -155,5 +123,68 @@ public class UpstreamForwarder {
             // 5. 请求类动作按顺序号执行；补头覆盖同名值（包括调用方自己塞的），删头彻底删除
             HeaderActionApplier.applyRequestActions(route, headers);
         }).build();
+        return new PreparedUpstreamRequest(mutated, bufferedBody);
+    }
+
+    /**
+     * 用已经准备好的请求发起一次上游调用。retryStatus 命中时：
+     * - 最后一次（deliverRetryStatus=true）把该上游响应原样交给 responseHandler，调用方看到真实状态；
+     * - 非最后一次先释放响应体并抛 {@link UpstreamStatusRetryException}，由韧性执行器决定是否重试。
+     */
+    public Mono<Void> forwardAttempt(PreparedUpstreamRequest prepared,
+                                     URI targetUri,
+                                     Function<UpstreamResponse, Mono<Void>> responseHandler,
+                                     Predicate<Integer> retryStatus) {
+        ServerHttpRequest request = prepared.request();
+        WebClient.RequestBodySpec spec = webClient
+                .method(HttpMethod.valueOf(request.getMethod().name()))
+                .uri(targetUri)
+                .headers(h -> h.addAll(request.getHeaders()));
+
+        BodyInserter<?, ? super org.springframework.http.client.reactive.ClientHttpRequest> body =
+                prepared.bodyBytes() != null
+                        ? BodyInserters.fromValue(prepared.bodyBytes())
+                        : BodyInserters.fromDataBuffers(request.getBody());
+
+        return spec.body(body).exchangeToMono(response -> {
+            int status = response.statusCode().value();
+            if (retryStatus.test(status)) {
+                // 读完/释放响应体后再重试，不能让这条上游连接悬着；最终尝试不会走这里。
+                return response.releaseBody()
+                        .then(Mono.error(new UpstreamStatusRetryException(status)));
+            }
+            UpstreamResponse upstreamResponse = new UpstreamResponse(
+                    status,
+                    response.headers().asHttpHeaders(),
+                    response.bodyToFlux(DataBuffer.class));
+            return responseHandler.apply(upstreamResponse);
+        });
+    }
+
+    /**
+     * 拼上游目标地址：上游 base（scheme://host:port）+ 原始请求路径（含原始 query）。
+     * 用原始（raw）形式拼接，避免对已经编码过的路径做二次编码。
+     */
+    public static URI resolveTargetUri(String upstreamBase, ServerHttpRequest request) {
+        URI base = URI.create(upstreamBase);
+        StringBuilder sb = new StringBuilder();
+        sb.append(base.getScheme()).append("://").append(base.getRawAuthority());
+        // base 里带的路径前缀（如 http://host/svc）拼在请求路径前；一般配置里不带
+        String basePath = base.getRawPath();
+        if (basePath != null && !basePath.isBlank() && !"/".equals(basePath)) {
+            sb.append(basePath);
+        }
+        sb.append(request.getPath().pathWithinApplication().value());
+        if (request.getURI().getRawQuery() != null) {
+            sb.append('?').append(request.getURI().getRawQuery());
+        }
+        return URI.create(sb.toString());
+    }
+
+    /**
+     * 已完成请求头改写的一次转发输入。bodyBytes 非空表示可重复发送的小请求体；
+     * 为空表示使用 {@link ServerHttpRequest#getBody()} 流式发送，调用方不得重试。
+     */
+    public record PreparedUpstreamRequest(ServerHttpRequest request, byte[] bodyBytes) {
     }
 }

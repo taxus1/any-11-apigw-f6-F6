@@ -50,7 +50,8 @@ class GatewayCorsWebFilterTest {
         upstream = new FakeUpstream();
         store = new InMemoryRouteStore();
         var props = new GatewayProxyProperties(
-                Duration.ofMillis(500), Duration.ofMillis(800), Duration.ofHours(1));
+                Duration.ofMillis(500), Duration.ofMillis(800), Duration.ofHours(1),
+                200, 200, org.springframework.util.unit.DataSize.ofMegabytes(1));
         catalog = new RouteCatalog(store, props);
         loadRoutes();
 
@@ -67,7 +68,12 @@ class GatewayCorsWebFilterTest {
                 .build();
         var proxyFilter = new GatewayProxyWebFilter(
                 catalog, new RouteMatcher(),
-                new com.apigw.proxy.forward.UpstreamForwarder(webClient),
+                new com.apigw.proxy.resilience.ResilientUpstreamExecutor(
+                        new com.apigw.proxy.forward.UpstreamForwarder(webClient),
+                        new com.apigw.proxy.resilience.CircuitBreakerRegistry(),
+                        new GatewayProxyProperties(Duration.ofSeconds(3), Duration.ofSeconds(10),
+                                Duration.ofHours(1), 200, 200,
+                                org.springframework.util.unit.DataSize.ofMegabytes(1))),
                 new AccessLogRecorder(), e -> { }, new ObjectMapper(),
                 // 配上验签器，受保护路由缺令牌时才会走 401（而不是配置缺失的 503）
                 new UserAuthGatekeeper(

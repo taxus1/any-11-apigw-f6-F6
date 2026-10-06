@@ -2,9 +2,12 @@ package com.apigw.interfaces.rest.route;
 
 import com.apigw.application.route.GatewayRouteAppService;
 import com.apigw.common.Result;
+import com.apigw.domain.route.CircuitBreakerPolicy;
+import com.apigw.domain.route.DurationSpec;
 import com.apigw.domain.route.GatewayRoute;
 import com.apigw.domain.route.GatewayRule;
 import com.apigw.domain.route.GrayGroup;
+import com.apigw.domain.route.RetryPolicy;
 import com.apigw.infrastructure.store.dto.PageResult;
 import com.apigw.infrastructure.store.dto.RouteView;
 import com.apigw.interfaces.rest.route.vo.RouteDetailVO;
@@ -92,9 +95,13 @@ public class GatewayRouteController {
                 : body.actions().stream().map(GatewayRouteController::toRule).toList();
         List<GrayGroup> groups = body.grayGroups() == null ? List.of()
                 : body.grayGroups().stream().map(GatewayRouteController::toGrayGroup).toList();
+        CircuitBreakerPolicy circuitBreaker = body.circuitBreaker() == null
+                ? CircuitBreakerPolicy.disabled() : toCircuitBreaker(body.circuitBreaker());
+        RetryPolicy retry = body.retry() == null
+                ? RetryPolicy.disabled() : toRetry(body.retry());
         return appService.assemble(body.routeNo(), body.name(), body.upstream(),
                 body.enabled(), body.authRequired(), body.remark(), body.version(),
-                conditions, actions, groups);
+                conditions, actions, groups, circuitBreaker, retry);
     }
 
     private static GatewayRule toRule(RouteSaveVO.RuleVO vo) {
@@ -103,5 +110,20 @@ public class GatewayRouteController {
 
     private static GrayGroup toGrayGroup(RouteSaveVO.GrayGroupVO vo) {
         return GrayGroup.create(vo.groupName(), vo.upstream(), vo.weight(), vo.tags());
+    }
+
+    private static CircuitBreakerPolicy toCircuitBreaker(RouteSaveVO.CircuitBreakerVO vo) {
+        return CircuitBreakerPolicy.of(vo.enabled(), vo.windowSize(), vo.minimumCalls(),
+                vo.failureRate(), DurationSpec.parse(vo.openDuration()),
+                vo.halfOpenPermitPercent(),
+                vo.failureStatuses() == null ? null : java.util.Set.copyOf(vo.failureStatuses()));
+    }
+
+    private static RetryPolicy toRetry(RouteSaveVO.RetryVO vo) {
+        return RetryPolicy.of(vo.enabled(), vo.maxAttempts(),
+                DurationSpec.parse(vo.backoff()), DurationSpec.parse(vo.totalTimeout()),
+                vo.retryMethods() == null ? null : java.util.Set.copyOf(vo.retryMethods()),
+                vo.idempotent(),
+                vo.retryStatuses() == null ? null : java.util.Set.copyOf(vo.retryStatuses()));
     }
 }

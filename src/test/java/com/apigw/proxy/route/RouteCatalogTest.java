@@ -29,7 +29,8 @@ import static org.mockito.Mockito.when;
 class RouteCatalogTest {
 
     private final GatewayProxyProperties props =
-            new GatewayProxyProperties(Duration.ofSeconds(1), Duration.ofSeconds(1), Duration.ofHours(1));
+            new GatewayProxyProperties(Duration.ofSeconds(1), Duration.ofSeconds(1), Duration.ofHours(1),
+                    200, 200, org.springframework.util.unit.DataSize.ofMegabytes(1));
 
     private GatewayRule pathPrefix(String v) {
         return GatewayRule.create(null, "PATH_PREFIX", null, v, 1);

@@ -1,9 +1,12 @@
 package com.apigw.infrastructure.store;
 
 import com.apigw.common.exception.BizException;
+import com.apigw.domain.route.CircuitBreakerPolicy;
+import com.apigw.domain.route.DurationSpec;
 import com.apigw.domain.route.GatewayRoute;
 import com.apigw.domain.route.GrayGroup;
 import com.apigw.domain.route.GatewayRule;
+import com.apigw.domain.route.RetryPolicy;
 import com.apigw.domain.route.RuleTypes;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -271,6 +274,10 @@ public class RouteStore {
         public List<RuleDto> actions = new ArrayList<>();
         /** 灰度分组：旧配置 JSON 没这个字段时为 null，toDomain 按「无灰度」落，向后兼容。 */
         public List<GrayGroupDto> grayGroups;
+        /** 熔断配置：旧配置缺字段时为 null，toDomain 按关闭处理。 */
+        public CircuitBreakerDto circuitBreaker;
+        /** 重试配置：旧配置缺字段时为 null，toDomain 按关闭处理。 */
+        public RetryDto retry;
 
         static Dto from(GatewayRoute r) {
             Dto d = new Dto();
@@ -286,6 +293,8 @@ public class RouteStore {
             d.actions = r.getActions().stream().map(RuleDto::from).toList();
             d.grayGroups = r.getGrayGroups() == null ? List.of()
                     : r.getGrayGroups().stream().map(GrayGroupDto::from).toList();
+            d.circuitBreaker = CircuitBreakerDto.from(r.getCircuitBreaker());
+            d.retry = RetryDto.from(r.getRetry());
             return d;
         }
 
@@ -302,6 +311,8 @@ public class RouteStore {
             // 旧 JSON 缺字段（null）= 无灰度，全量流量回主上游
             r.replaceGrayGroups(
                     grayGroups == null ? List.of() : grayGroups.stream().map(GrayGroupDto::toDomain).toList());
+            r.configureCircuitBreaker(circuitBreaker == null ? null : circuitBreaker.toDomain());
+            r.configureRetry(retry == null ? null : retry.toDomain());
             r.getConditions().forEach(x -> x.setRuleKind(RuleTypes.KIND_CONDITION));
             r.getActions().forEach(x -> x.setRuleKind(RuleTypes.KIND_ACTION));
             return r;
@@ -330,6 +341,72 @@ public class RouteStore {
 
         GatewayRule toDomain() {
             return GatewayRule.create(stage, type, name, value, sortNo);
+        }
+    }
+
+    /** 熔断配置在 Redis 里的形状。时长用可读字符串，解析和校验在领域策略里。 */
+    public static class CircuitBreakerDto {
+        public Boolean enabled;
+        public Integer windowSize;
+        public Integer minimumCalls;
+        public Integer failureRate;
+        public String openDuration;
+        public Integer halfOpenPermitPercent;
+        public List<Integer> failureStatuses;
+
+        static CircuitBreakerDto from(CircuitBreakerPolicy p) {
+            if (p == null) {
+                return null;
+            }
+            CircuitBreakerDto d = new CircuitBreakerDto();
+            d.enabled = p.isEnabled();
+            d.windowSize = p.windowSize();
+            d.minimumCalls = p.minimumCalls();
+            d.failureRate = p.failureRate();
+            d.openDuration = DurationSpec.format(p.openDuration());
+            d.halfOpenPermitPercent = p.halfOpenPermitPercent();
+            d.failureStatuses = p.failureStatuses().stream().sorted().toList();
+            return d;
+        }
+
+        CircuitBreakerPolicy toDomain() {
+            return CircuitBreakerPolicy.of(enabled, windowSize, minimumCalls, failureRate,
+                    DurationSpec.parse(openDuration), halfOpenPermitPercent,
+                    failureStatuses == null ? null : new java.util.HashSet<>(failureStatuses));
+        }
+    }
+
+    /** 重试配置在 Redis 里的形状。方法大写集合原样存取，最终校验在领域策略里。 */
+    public static class RetryDto {
+        public Boolean enabled;
+        public Integer maxAttempts;
+        public String backoff;
+        public String totalTimeout;
+        public List<String> retryMethods;
+        public Boolean idempotent;
+        public List<Integer> retryStatuses;
+
+        static RetryDto from(RetryPolicy p) {
+            if (p == null) {
+                return null;
+            }
+            RetryDto d = new RetryDto();
+            d.enabled = p.isEnabled();
+            d.maxAttempts = p.maxAttempts();
+            d.backoff = DurationSpec.format(p.backoff());
+            d.totalTimeout = DurationSpec.format(p.totalTimeout());
+            d.retryMethods = p.retryMethods().stream().sorted().toList();
+            d.idempotent = p.idempotent();
+            d.retryStatuses = p.retryStatuses().stream().sorted().toList();
+            return d;
+        }
+
+        RetryPolicy toDomain() {
+            return RetryPolicy.of(enabled, maxAttempts,
+                    DurationSpec.parse(backoff), DurationSpec.parse(totalTimeout),
+                    retryMethods == null ? null : new java.util.HashSet<>(retryMethods),
+                    idempotent,
+                    retryStatuses == null ? null : new java.util.HashSet<>(retryStatuses));
         }
     }
 

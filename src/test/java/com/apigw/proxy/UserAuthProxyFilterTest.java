@@ -64,7 +64,8 @@ class UserAuthProxyFilterTest {
         upstream = new FakeUpstream();
         store = new InMemoryRouteStore();
         var props = new GatewayProxyProperties(
-                Duration.ofMillis(500), Duration.ofMillis(800), Duration.ofHours(1));
+                Duration.ofMillis(500), Duration.ofMillis(800), Duration.ofHours(1),
+                200, 200, org.springframework.util.unit.DataSize.ofMegabytes(1));
         catalog = new RouteCatalog(store, props);
 
         passSigner = new GatewayPassSigner(PASS_SECRET);
@@ -84,7 +85,13 @@ class UserAuthProxyFilterTest {
                 .clientConnector(new org.springframework.http.client.reactive.ReactorClientHttpConnector(nettyClient))
                 .build();
         var filter = new GatewayProxyWebFilter(
-                catalog, new RouteMatcher(), new UpstreamForwarder(webClient),
+                catalog, new RouteMatcher(),
+                new com.apigw.proxy.resilience.ResilientUpstreamExecutor(
+                        new UpstreamForwarder(webClient),
+                        new com.apigw.proxy.resilience.CircuitBreakerRegistry(),
+                        new GatewayProxyProperties(Duration.ofMillis(500), Duration.ofMillis(800),
+                                Duration.ofHours(1), 200, 200,
+                                org.springframework.util.unit.DataSize.ofMegabytes(1))),
                 new AccessLogRecorder(), e -> { }, new ObjectMapper(), gatekeeper,
                 new com.apigw.proxy.gray.GrayReleaseSelector(
                         new com.apigw.proxy.gray.GrayProperties(null)));

@@ -15,6 +15,8 @@ import com.apigw.proxy.forward.UpstreamResponse;
 import com.apigw.proxy.gray.GrayReleaseSelector;
 import com.apigw.proxy.gray.GrayTarget;
 import com.apigw.proxy.match.RouteMatcher;
+import com.apigw.proxy.resilience.CircuitOpenException;
+import com.apigw.proxy.resilience.ResilientUpstreamExecutor;
 import com.apigw.proxy.route.RouteCatalog;
 import com.apigw.proxy.route.RouteSnapshot;
 import com.apigw.proxy.userauth.OutboundAuth;
@@ -80,7 +82,7 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
 
     private final RouteCatalog routeCatalog;
     private final RouteMatcher routeMatcher;
-    private final UpstreamForwarder forwarder;
+    private final ResilientUpstreamExecutor upstreamExecutor;
     private final AccessLogRecorder accessLog;
     private final AccessLogSink accessLogSink;
     private final ObjectMapper objectMapper;
@@ -89,7 +91,7 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
 
     public GatewayProxyWebFilter(RouteCatalog routeCatalog,
                                  RouteMatcher routeMatcher,
-                                 UpstreamForwarder forwarder,
+                                 ResilientUpstreamExecutor upstreamExecutor,
                                  AccessLogRecorder accessLog,
                                  AccessLogSink accessLogSink,
                                  ObjectMapper objectMapper,
@@ -97,7 +99,7 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
                                  GrayReleaseSelector graySelector) {
         this.routeCatalog = routeCatalog;
         this.routeMatcher = routeMatcher;
-        this.forwarder = forwarder;
+        this.upstreamExecutor = upstreamExecutor;
         this.accessLog = accessLog;
         this.accessLogSink = accessLogSink;
         this.objectMapper = objectMapper;
@@ -200,8 +202,8 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
                             traceId, exchange.getRequest(), identity);
                     // 响应处理必须在 WebClient 的 exchangeToMono 回调内完成（此时仍持有上游连接），
                     // 所以把 writeUpstreamResponse 作为 handler 传进去
-                    return forwarder.forward(route, exchange.getRequest(), traceId, targetUri,
-                            outboundAuth,
+                    return upstreamExecutor.execute(route, exchange.getRequest(), traceId, targetUri,
+                            groupName, outboundAuth,
                             upstream -> writeUpstreamResponse(exchange, route, upstream))
                             .onErrorResume(err -> {
                                 UpstreamFailureKind kind = UpstreamFailureKind.classify(err);
@@ -281,7 +283,12 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
                             Throwable detail) {
         // 服务端日志留全证据（含堆栈）；调用方只拿得到 kind 的固定文案，拿不到这行
         log.warn("转发失败 kind={} traceId={}", kind.errorCode(), traceId, detail);
-        return GatewayErrors.write(exchange, objectMapper, kind, traceId, detail);
+        java.util.Map<String, String> extraHeaders = java.util.Map.of();
+        if (detail instanceof CircuitOpenException open && open.retryAfter() != null) {
+            long seconds = Math.max(1, (open.retryAfter().toMillis() + 999) / 1000);
+            extraHeaders = java.util.Map.of("Retry-After", String.valueOf(seconds));
+        }
+        return GatewayErrors.write(exchange, objectMapper, kind, traceId, detail, extraHeaders);
     }
 
     /**
